@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -8,15 +10,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"golang.org/x/crypto/ssh"
 )
@@ -200,11 +205,15 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		s.writeGitHTTPError(w, err)
 		return
 	}
+	// Open is per-RPC. A snapshot-capable backend would bind the request's
+	// stable read view or write transaction state here.
 
 	w.Header().Set("Cache-Control", "no-cache")
 
 	if advertiseRefs {
 		w.Header().Set("Content-Type", fmt.Sprintf("application/x-%s-advertisement", service.String()))
+		// info/refs is read-only. If refs can change concurrently, the read
+		// snapshot boundary should cover this whole advertise-refs RPC.
 		if err := transport.AdvertiseReferences(ctx, st, w, service, true); err != nil {
 			s.writeGitHTTPError(w, err)
 		}
@@ -213,14 +222,32 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", fmt.Sprintf("application/x-%s-result", service.String()))
 	writeCloser := responseWriteCloser{Writer: w}
+	reader := io.ReadCloser(r.Body)
+
+	var lockLog *receivePackLog
+	if service == transport.ReceivePackService {
+		reader, lockLog = previewReceivePackRequest(r.Body)
+		s.logReceivePackBoundaryStart("http", repo, lockLog)
+		defer s.logReceivePackBoundaryEnd("http", repo, lockLog)
+	}
 
 	switch service {
 	case transport.UploadPackService:
-		err = transport.UploadPack(ctx, st, r.Body, writeCloser, &transport.UploadPackOptions{
+		// upload-pack is read-only, but it needs a stable repo view for the
+		// whole fetch/clone RPC. A read snapshot or shared lock would start
+		// before this call and end when it returns.
+		err = transport.UploadPack(ctx, st, reader, writeCloser, &transport.UploadPackOptions{
 			StatelessRPC: true,
 		})
 	case transport.ReceivePackService:
-		err = transport.ReceivePack(ctx, st, r.Body, writeCloser, &transport.ReceivePackOptions{
+		// receive-pack is the write boundary. A future per-repo/per-ref lock or
+		// ref transaction should begin before this call and be released only
+		// after the full push RPC completes.
+		//
+		// If we move past a repo-wide lock, the refs named in this push still
+		// need to be locked as one group: acquire the full sorted ref set before
+		// mutating anything, then release the whole group after the RPC finishes.
+		err = transport.ReceivePack(ctx, st, reader, writeCloser, &transport.ReceivePackOptions{
 			StatelessRPC: true,
 		})
 	default:
@@ -387,15 +414,41 @@ func (s *Server) runSSHCommand(command string, channel ssh.Channel, stderr io.Wr
 		_, _ = fmt.Fprintln(stderr, err.Error())
 		return 1
 	}
+	// Open is per-RPC. A snapshot-capable backend would bind the request's
+	// stable read view or write transaction state here.
 
 	reader := io.NopCloser(channel)
 	writer := channelWriteCloser{Channel: channel}
+	var readStream io.ReadCloser = reader
+
+	var lockLog *receivePackLog
+	if service == transport.ReceivePackService {
+		recorder := newReceivePackRecorder(reader)
+		readStream = recorder
+		lockLog = &receivePackLog{started: time.Now()}
+		s.logReceivePackBoundaryStart("ssh", repo, lockLog)
+		defer func() {
+			recorded := recorder.details()
+			recorded.started = lockLog.started
+			s.logReceivePackBoundaryEnd("ssh", repo, recorded)
+		}()
+	}
 
 	switch service {
 	case transport.UploadPackService:
-		err = transport.UploadPack(ctx, st, reader, writer, nil)
+		// upload-pack is read-only, but it needs a stable repo view for the
+		// whole fetch/clone RPC. A read snapshot or shared lock would start
+		// before this call and end when it returns.
+		err = transport.UploadPack(ctx, st, readStream, writer, nil)
 	case transport.ReceivePackService:
-		err = transport.ReceivePack(ctx, st, reader, writer, nil)
+		// receive-pack is the write boundary. A future per-repo/per-ref lock or
+		// ref transaction should begin before this call and be released only
+		// after the full push RPC completes.
+		//
+		// If we move past a repo-wide lock, the refs named in this push still
+		// need to be locked as one group: acquire the full sorted ref set before
+		// mutating anything, then release the whole group after the RPC finishes.
+		err = transport.ReceivePack(ctx, st, readStream, writer, nil)
 	default:
 		err = fmt.Errorf("unsupported service %q", service)
 	}
@@ -572,4 +625,99 @@ type channelWriteCloser struct {
 
 func (w channelWriteCloser) Close() error {
 	return w.Channel.CloseWrite()
+}
+
+type receivePackLog struct {
+	commands []string
+	parseErr error
+	started  time.Time
+}
+
+type receivePackRecorder struct {
+	source io.ReadCloser
+	tee    io.Reader
+	buffer bytes.Buffer
+}
+
+func previewReceivePackRequest(r io.Reader) (io.ReadCloser, *receivePackLog) {
+	buffered := bufio.NewReader(r)
+	var prefix bytes.Buffer
+
+	request := packp.NewUpdateRequests()
+	parseErr := request.Decode(io.TeeReader(buffered, &prefix))
+
+	return io.NopCloser(io.MultiReader(bytes.NewReader(prefix.Bytes()), buffered)), &receivePackLog{
+		commands: summarizeReceivePackCommands(request.Commands),
+		parseErr: parseErr,
+		started:  time.Now(),
+	}
+}
+
+func newReceivePackRecorder(source io.ReadCloser) *receivePackRecorder {
+	recorder := &receivePackRecorder{source: source}
+	recorder.tee = io.TeeReader(source, &recorder.buffer)
+	return recorder
+}
+
+func (r *receivePackRecorder) Read(p []byte) (int, error) {
+	return r.tee.Read(p)
+}
+
+func (r *receivePackRecorder) Close() error {
+	return r.source.Close()
+}
+
+func (r *receivePackRecorder) details() *receivePackLog {
+	request := packp.NewUpdateRequests()
+	parseErr := request.Decode(bytes.NewReader(r.buffer.Bytes()))
+
+	return &receivePackLog{
+		commands: summarizeReceivePackCommands(request.Commands),
+		parseErr: parseErr,
+	}
+}
+
+func summarizeReceivePackCommands(commands []*packp.Command) []string {
+	if len(commands) == 0 {
+		return nil
+	}
+
+	summary := make([]string, 0, len(commands))
+	for _, command := range commands {
+		summary = append(summary, fmt.Sprintf("%s:%s", command.Action(), command.Name))
+	}
+	sort.Strings(summary)
+	return summary
+}
+
+func (s *Server) logReceivePackBoundaryStart(protocol, repo string, details *receivePackLog) {
+	if details == nil {
+		return
+	}
+
+	if len(details.commands) == 0 && details.parseErr == nil {
+		log.Printf("receive-pack lock start protocol=%s repo=%s updates=pending", protocol, repo)
+		return
+	}
+
+	if details.parseErr != nil {
+		log.Printf("receive-pack lock start protocol=%s repo=%s updates=%v parse_error=%v", protocol, repo, details.commands, details.parseErr)
+		return
+	}
+
+	log.Printf("receive-pack lock start protocol=%s repo=%s updates=%v", protocol, repo, details.commands)
+}
+
+func (s *Server) logReceivePackBoundaryEnd(protocol, repo string, details *receivePackLog) {
+	if details == nil {
+		return
+	}
+
+	duration := time.Since(details.started).Round(time.Millisecond)
+	if details.parseErr != nil {
+		log.Printf("receive-pack lock end protocol=%s repo=%s duration=%s updates=%v parse_error=%v", protocol, repo, duration, details.commands, details.parseErr)
+		return
+	}
+
+	log.Printf("receive-pack lock end protocol=%s repo=%s duration=%s updates=%v", protocol, repo, duration, details.commands)
 }

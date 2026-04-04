@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -8,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -16,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -95,6 +99,50 @@ func TestOperationContextSetsThirtySecondDeadline(t *testing.T) {
 	diff := deadline.Sub(before)
 	if diff < 29*time.Second || diff > 31*time.Second {
 		t.Fatalf("expected ~30s deadline, got %v", diff)
+	}
+}
+
+func TestPreviewReceivePackRequestReplaysOriginalStream(t *testing.T) {
+	t.Parallel()
+
+	updateReq := packp.NewUpdateRequests()
+	updateReq.Commands = []*packp.Command{
+		{
+			Name: plumbing.NewBranchReferenceName("feature"),
+			Old:  plumbing.NewHash(strings.Repeat("1", 40)),
+			New:  plumbing.NewHash(strings.Repeat("2", 40)),
+		},
+		{
+			Name: plumbing.NewBranchReferenceName("main"),
+			Old:  plumbing.ZeroHash,
+			New:  plumbing.NewHash(strings.Repeat("3", 40)),
+		},
+	}
+
+	var payload bytes.Buffer
+	if err := updateReq.Encode(&payload); err != nil {
+		t.Fatalf("encode update request: %v", err)
+	}
+
+	original := append([]byte(nil), payload.Bytes()...)
+	original = append(original, []byte("PACKtoydata")...)
+
+	replayed, details := previewReceivePackRequest(bytes.NewReader(original))
+	if details.parseErr != nil {
+		t.Fatalf("preview receive-pack request: %v", details.parseErr)
+	}
+
+	if got, want := strings.Join(details.commands, ","), "create:refs/heads/main,update:refs/heads/feature"; got != want {
+		t.Fatalf("unexpected command summary: got %q want %q", got, want)
+	}
+
+	got, err := io.ReadAll(replayed)
+	if err != nil {
+		t.Fatalf("read replayed stream: %v", err)
+	}
+
+	if !bytes.Equal(got, original) {
+		t.Fatalf("replayed stream did not match original")
 	}
 }
 

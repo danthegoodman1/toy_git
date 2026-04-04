@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	gitconfig "github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -298,33 +300,49 @@ func (s *diskStorer) SetReference(ref *plumbing.Reference) error {
 	if err := s.checkContext(); err != nil {
 		return err
 	}
+	done := s.logMetadataLockBoundary("set-reference", ref.Name().String())
+	defer func() { done(nil) }()
 
 	data := ref.Strings()[1] + "\n"
-	return s.writeFileAtomic(s.referencePath(ref.Name()), []byte(data), 0o644)
+	err := s.writeFileAtomic(s.referencePath(ref.Name()), []byte(data), 0o644)
+	done(err)
+	return err
 }
 
 func (s *diskStorer) CheckAndSetReference(newRef, old *plumbing.Reference) error {
 	if err := s.checkContext(); err != nil {
 		return err
 	}
+	done := s.logMetadataLockBoundary("check-and-set-reference", newRef.Name().String())
+	defer func() { done(nil) }()
 
 	current, err := s.Reference(newRef.Name())
 	if old == nil {
 		if err == nil {
-			return s.SetReference(newRef)
-		}
-		if !errors.Is(err, plumbing.ErrReferenceNotFound) {
+			err = s.writeReference(newRef)
+			done(err)
 			return err
 		}
-		return s.SetReference(newRef)
+		if !errors.Is(err, plumbing.ErrReferenceNotFound) {
+			done(err)
+			return err
+		}
+		err = s.writeReference(newRef)
+		done(err)
+		return err
 	}
 	if err != nil {
+		done(err)
 		return err
 	}
 	if !referencesEqual(current, old) {
-		return storage.ErrReferenceHasChanged
+		err = storage.ErrReferenceHasChanged
+		done(err)
+		return err
 	}
-	return s.SetReference(newRef)
+	err = s.writeReference(newRef)
+	done(err)
+	return err
 }
 
 func (s *diskStorer) Reference(name plumbing.ReferenceName) (*plumbing.Reference, error) {
@@ -396,11 +414,14 @@ func (s *diskStorer) RemoveReference(name plumbing.ReferenceName) error {
 	if err := s.checkContext(); err != nil {
 		return err
 	}
+	done := s.logMetadataLockBoundary("remove-reference", name.String())
+	defer func() { done(nil) }()
 
 	err := os.Remove(s.referencePath(name))
 	if errors.Is(err, os.ErrNotExist) {
-		return plumbing.ErrReferenceNotFound
+		err = plumbing.ErrReferenceNotFound
 	}
+	done(err)
 	return err
 }
 
@@ -433,12 +454,16 @@ func (s *diskStorer) SetShallow(hashes []plumbing.Hash) error {
 	if err := s.checkContext(); err != nil {
 		return err
 	}
+	done := s.logMetadataLockBoundary("set-shallow", "shallow")
+	defer func() { done(nil) }()
 
 	if len(hashes) == 0 {
 		err := os.Remove(filepath.Join(s.root, "shallow"))
 		if errors.Is(err, os.ErrNotExist) {
+			done(nil)
 			return nil
 		}
+		done(err)
 		return err
 	}
 
@@ -447,7 +472,9 @@ func (s *diskStorer) SetShallow(hashes []plumbing.Hash) error {
 		buf.WriteString(hash.String())
 		buf.WriteByte('\n')
 	}
-	return s.writeFileAtomic(filepath.Join(s.root, "shallow"), buf.Bytes(), 0o644)
+	err := s.writeFileAtomic(filepath.Join(s.root, "shallow"), buf.Bytes(), 0o644)
+	done(err)
+	return err
 }
 
 func (s *diskStorer) Shallow() ([]plumbing.Hash, error) {
@@ -502,6 +529,8 @@ func (s *diskStorer) SetIndex(idx *formatindex.Index) error {
 	if err := s.checkContext(); err != nil {
 		return err
 	}
+	done := s.logMetadataLockBoundary("set-index", "index")
+	defer func() { done(nil) }()
 
 	if idx == nil {
 		idx = &formatindex.Index{Version: 2}
@@ -513,9 +542,12 @@ func (s *diskStorer) SetIndex(idx *formatindex.Index) error {
 	var buf bytes.Buffer
 	encoder := formatindex.NewEncoder(&buf, s.newIndexHash())
 	if err := encoder.Encode(idx); err != nil {
+		done(err)
 		return err
 	}
-	return s.writeFileAtomic(filepath.Join(s.root, "index"), buf.Bytes(), 0o644)
+	err := s.writeFileAtomic(filepath.Join(s.root, "index"), buf.Bytes(), 0o644)
+	done(err)
+	return err
 }
 
 func (s *diskStorer) Config() (*gitconfig.Config, error) {
@@ -545,6 +577,8 @@ func (s *diskStorer) SetConfig(cfg *gitconfig.Config) error {
 	if err := s.checkContext(); err != nil {
 		return err
 	}
+	done := s.logMetadataLockBoundary("set-config", "config")
+	defer func() { done(nil) }()
 
 	if cfg == nil {
 		cfg = gitconfig.NewConfig()
@@ -553,9 +587,36 @@ func (s *diskStorer) SetConfig(cfg *gitconfig.Config) error {
 
 	data, err := cfg.Marshal()
 	if err != nil {
+		done(err)
 		return err
 	}
-	return s.writeFileAtomic(filepath.Join(s.root, "config"), data, 0o644)
+	err = s.writeFileAtomic(filepath.Join(s.root, "config"), data, 0o644)
+	done(err)
+	return err
+}
+
+func (s *diskStorer) writeReference(ref *plumbing.Reference) error {
+	data := ref.Strings()[1] + "\n"
+	return s.writeFileAtomic(s.referencePath(ref.Name()), []byte(data), 0o644)
+}
+
+func (s *diskStorer) logMetadataLockBoundary(operation, target string) func(error) {
+	started := time.Now()
+	finished := false
+	log.Printf("metadata lock start repo_root=%s operation=%s target=%s assumption=immutable-objects", s.root, operation, target)
+
+	return func(err error) {
+		if finished {
+			return
+		}
+		finished = true
+		duration := time.Since(started).Round(time.Millisecond)
+		if err != nil {
+			log.Printf("metadata lock end repo_root=%s operation=%s target=%s duration=%s assumption=immutable-objects err=%v", s.root, operation, target, duration, err)
+			return
+		}
+		log.Printf("metadata lock end repo_root=%s operation=%s target=%s duration=%s assumption=immutable-objects", s.root, operation, target, duration)
+	}
 }
 
 func (s *diskStorer) Module(name string) (storage.Storer, error) {
