@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -422,13 +423,14 @@ func (s *Server) runSSHCommand(command string, channel ssh.Channel, stderr io.Wr
 	var readStream io.ReadCloser = reader
 
 	var lockLog *receivePackLog
+	var preview *receivePackPreviewReader
 	if service == transport.ReceivePackService {
-		recorder := newReceivePackRecorder(reader)
-		readStream = recorder
+		preview = newReceivePackPreviewReader(reader)
+		readStream = preview
 		lockLog = &receivePackLog{started: time.Now()}
 		s.logReceivePackBoundaryStart("ssh", repo, lockLog)
 		defer func() {
-			recorded := recorder.details()
+			recorded := preview.details()
 			recorded.started = lockLog.started
 			s.logReceivePackBoundaryEnd("ssh", repo, recorded)
 		}()
@@ -633,10 +635,16 @@ type receivePackLog struct {
 	started  time.Time
 }
 
-type receivePackRecorder struct {
-	source io.ReadCloser
-	tee    io.Reader
-	buffer bytes.Buffer
+type receivePackPreviewReader struct {
+	source  io.ReadCloser
+	preview receivePackPreview
+}
+
+type receivePackPreview struct {
+	prefix   bytes.Buffer
+	pending  []byte
+	parseErr error
+	complete bool
 }
 
 func previewReceivePackRequest(r io.Reader) (io.ReadCloser, *receivePackLog) {
@@ -653,23 +661,72 @@ func previewReceivePackRequest(r io.Reader) (io.ReadCloser, *receivePackLog) {
 	}
 }
 
-func newReceivePackRecorder(source io.ReadCloser) *receivePackRecorder {
-	recorder := &receivePackRecorder{source: source}
-	recorder.tee = io.TeeReader(source, &recorder.buffer)
-	return recorder
+func newReceivePackPreviewReader(source io.ReadCloser) *receivePackPreviewReader {
+	return &receivePackPreviewReader{source: source}
 }
 
-func (r *receivePackRecorder) Read(p []byte) (int, error) {
-	return r.tee.Read(p)
+func (r *receivePackPreviewReader) Read(p []byte) (int, error) {
+	n, err := r.source.Read(p)
+	if n > 0 {
+		r.preview.consume(p[:n])
+	}
+	return n, err
 }
 
-func (r *receivePackRecorder) Close() error {
+func (r *receivePackPreviewReader) Close() error {
 	return r.source.Close()
 }
 
-func (r *receivePackRecorder) details() *receivePackLog {
+func (r *receivePackPreviewReader) details() *receivePackLog {
+	return r.preview.details()
+}
+
+func (p *receivePackPreview) consume(chunk []byte) {
+	if p.complete || len(chunk) == 0 {
+		return
+	}
+
+	p.pending = append(p.pending, chunk...)
+	for {
+		if len(p.pending) < 4 {
+			return
+		}
+
+		pktLen, err := strconv.ParseUint(string(p.pending[:4]), 16, 16)
+		if err != nil {
+			p.parseErr = err
+			p.complete = true
+			p.pending = nil
+			return
+		}
+
+		if pktLen == 0 {
+			_, _ = p.prefix.Write(p.pending[:4])
+			p.complete = true
+			p.pending = nil
+			return
+		}
+		if pktLen < 4 {
+			p.parseErr = fmt.Errorf("invalid pkt-line length %d", pktLen)
+			p.complete = true
+			p.pending = nil
+			return
+		}
+		if len(p.pending) < int(pktLen) {
+			return
+		}
+
+		_, _ = p.prefix.Write(p.pending[:pktLen])
+		p.pending = p.pending[pktLen:]
+	}
+}
+
+func (p *receivePackPreview) details() *receivePackLog {
 	request := packp.NewUpdateRequests()
-	parseErr := request.Decode(bytes.NewReader(r.buffer.Bytes()))
+	parseErr := p.parseErr
+	if parseErr == nil {
+		parseErr = request.Decode(bytes.NewReader(p.prefix.Bytes()))
+	}
 
 	return &receivePackLog{
 		commands: summarizeReceivePackCommands(request.Commands),

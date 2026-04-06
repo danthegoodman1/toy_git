@@ -146,6 +146,146 @@ func TestPreviewReceivePackRequestReplaysOriginalStream(t *testing.T) {
 	}
 }
 
+func TestPreviewReceivePackRequestDoesNotReadEntirePackIntoMemory(t *testing.T) {
+	t.Parallel()
+
+	updateReq := packp.NewUpdateRequests()
+	updateReq.Commands = []*packp.Command{
+		{
+			Name: plumbing.NewBranchReferenceName("main"),
+			Old:  plumbing.ZeroHash,
+			New:  plumbing.NewHash(strings.Repeat("3", 40)),
+		},
+	}
+
+	var payload bytes.Buffer
+	if err := updateReq.Encode(&payload); err != nil {
+		t.Fatalf("encode update request: %v", err)
+	}
+
+	largeTail := bytes.Repeat([]byte("PACK"), 1<<18)
+	original := append(append([]byte(nil), payload.Bytes()...), largeTail...)
+
+	source := &countingReader{data: original}
+	replayed, details := previewReceivePackRequest(source)
+	if details.parseErr != nil {
+		t.Fatalf("preview receive-pack request: %v", details.parseErr)
+	}
+
+	if source.bytesRead >= len(original) {
+		t.Fatalf("expected preview to leave pack data unread, read %d of %d bytes", source.bytesRead, len(original))
+	}
+
+	got, err := io.ReadAll(replayed)
+	if err != nil {
+		t.Fatalf("read replayed stream: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("replayed stream did not match original")
+	}
+}
+
+func TestReceivePackPreviewReaderCapturesOnlyCommandSection(t *testing.T) {
+	t.Parallel()
+
+	updateReq := packp.NewUpdateRequests()
+	updateReq.Commands = []*packp.Command{
+		{
+			Name: plumbing.NewBranchReferenceName("main"),
+			Old:  plumbing.ZeroHash,
+			New:  plumbing.NewHash(strings.Repeat("3", 40)),
+		},
+	}
+
+	var payload bytes.Buffer
+	if err := updateReq.Encode(&payload); err != nil {
+		t.Fatalf("encode update request: %v", err)
+	}
+
+	largeTail := bytes.Repeat([]byte("PACK"), 1<<18)
+	original := append(append([]byte(nil), payload.Bytes()...), largeTail...)
+
+	source := &countingReadCloser{countingReader: countingReader{data: original}}
+	preview := newReceivePackPreviewReader(source)
+
+	got, err := io.ReadAll(preview)
+	if err != nil {
+		t.Fatalf("read previewed stream: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("previewed stream did not match original")
+	}
+
+	details := preview.details()
+	if details.parseErr != nil {
+		t.Fatalf("unexpected parse error: %v", details.parseErr)
+	}
+	if got, want := strings.Join(details.commands, ","), "create:refs/heads/main"; got != want {
+		t.Fatalf("unexpected command summary: got %q want %q", got, want)
+	}
+	if source.bytesRead != len(original) {
+		t.Fatalf("expected to stream the full payload, read %d of %d bytes", source.bytesRead, len(original))
+	}
+	if preview.preview.prefix.Len() >= len(original) {
+		t.Fatalf("expected preview buffer to stay smaller than the payload, buffered %d of %d bytes", preview.preview.prefix.Len(), len(original))
+	}
+}
+
+func TestDiskStorerEncodedObjectStreamsFromDisk(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	storer := newDiskStorer(context.Background(), root)
+	if err := storer.Init(); err != nil {
+		t.Fatalf("init storer: %v", err)
+	}
+
+	payload := bytes.Repeat([]byte("hello-streaming-object"), 1024)
+	writer, err := storer.RawObjectWriter(plumbing.BlobObject, int64(len(payload)))
+	if err != nil {
+		t.Fatalf("create object writer: %v", err)
+	}
+	if _, err := writer.Write(payload); err != nil {
+		t.Fatalf("write object payload: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close object writer: %v", err)
+	}
+
+	diskWriter, ok := writer.(*diskObjectWriter)
+	if !ok {
+		t.Fatalf("expected diskObjectWriter, got %T", writer)
+	}
+
+	obj, err := storer.EncodedObject(plumbing.AnyObject, diskWriter.hash)
+	if err != nil {
+		t.Fatalf("load object: %v", err)
+	}
+
+	streamingObj, ok := obj.(*diskEncodedObject)
+	if !ok {
+		t.Fatalf("expected disk-backed object, got %T", obj)
+	}
+	if streamingObj.Size() != int64(len(payload)) {
+		t.Fatalf("unexpected object size: got %d want %d", streamingObj.Size(), len(payload))
+	}
+
+	reader, err := streamingObj.Reader()
+	if err != nil {
+		t.Fatalf("open object reader: %v", err)
+	}
+	defer reader.Close()
+
+	head := make([]byte, 32)
+	n, err := io.ReadFull(reader, head)
+	if err != nil {
+		t.Fatalf("read object header bytes: %v", err)
+	}
+	if !bytes.Equal(head[:n], payload[:n]) {
+		t.Fatalf("unexpected object contents")
+	}
+}
+
 func TestLFSTransferOverHTTP(t *testing.T) {
 	t.Parallel()
 
@@ -361,4 +501,29 @@ func assertContainsAny(t *testing.T, output string, needles ...string) {
 	}
 
 	t.Fatalf("expected output to contain one of %q, got: %s", needles, output)
+}
+
+type countingReader struct {
+	data      []byte
+	offset    int
+	bytesRead int
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	if r.offset >= len(r.data) {
+		return 0, io.EOF
+	}
+
+	n := copy(p, r.data[r.offset:])
+	r.offset += n
+	r.bytesRead += n
+	return n, nil
+}
+
+type countingReadCloser struct {
+	countingReader
+}
+
+func (r *countingReadCloser) Close() error {
+	return nil
 }

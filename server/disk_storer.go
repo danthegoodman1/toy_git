@@ -156,7 +156,8 @@ func (s *diskStorer) EncodedObject(typ plumbing.ObjectType, hash plumbing.Hash) 
 		return nil, err
 	}
 
-	file, err := os.Open(s.objectPath(hash))
+	path := s.objectPath(hash)
+	file, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, plumbing.ErrObjectNotFound
@@ -179,29 +180,12 @@ func (s *diskStorer) EncodedObject(typ plumbing.ObjectType, hash plumbing.Hash) 
 		return nil, plumbing.ErrObjectNotFound
 	}
 
-	content, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.checkContext(); err != nil {
-		return nil, err
-	}
-
-	obj := plumbing.NewMemoryObject(nil)
-	obj.SetType(actualType)
-	obj.SetSize(size)
-	writer, err := obj.Writer()
-	if err != nil {
-		return nil, err
-	}
-	if _, err := writer.Write(content); err != nil {
-		return nil, err
-	}
-	if err := writer.Close(); err != nil {
-		return nil, err
-	}
-
-	return obj, nil
+	return &diskEncodedObject{
+		path: path,
+		hash: hash,
+		typ:  actualType,
+		size: size,
+	}, nil
 }
 
 func (s *diskStorer) IterEncodedObjects(typ plumbing.ObjectType) (storer.EncodedObjectIter, error) {
@@ -754,6 +738,86 @@ func (w *diskObjectWriter) Close() error {
 	}
 
 	return os.Rename(w.file.Name(), finalPath)
+}
+
+type diskEncodedObject struct {
+	path string
+	hash plumbing.Hash
+	typ  plumbing.ObjectType
+	size int64
+}
+
+func (o *diskEncodedObject) Hash() plumbing.Hash {
+	return o.hash
+}
+
+func (*diskEncodedObject) SetType(plumbing.ObjectType) {}
+
+func (o *diskEncodedObject) Type() plumbing.ObjectType {
+	return o.typ
+}
+
+func (*diskEncodedObject) SetSize(int64) {}
+
+func (o *diskEncodedObject) Size() int64 {
+	return o.size
+}
+
+func (o *diskEncodedObject) Reader() (io.ReadCloser, error) {
+	file, err := os.Open(o.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, plumbing.ErrObjectNotFound
+		}
+		return nil, err
+	}
+
+	reader, err := objfile.NewReader(file)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+
+	actualType, size, err := reader.Header()
+	if err != nil {
+		_ = reader.Close()
+		_ = file.Close()
+		return nil, err
+	}
+	if actualType != o.typ || size != o.size {
+		_ = reader.Close()
+		_ = file.Close()
+		return nil, objfile.ErrHeader
+	}
+
+	return &multiReadCloser{reader: reader, closers: []io.Closer{file}}, nil
+}
+
+func (*diskEncodedObject) Writer() (io.WriteCloser, error) {
+	return nil, fmt.Errorf("not supported")
+}
+
+type multiReadCloser struct {
+	reader  io.ReadCloser
+	closers []io.Closer
+	closed  bool
+}
+
+func (r *multiReadCloser) Read(p []byte) (int, error) {
+	return r.reader.Read(p)
+}
+
+func (r *multiReadCloser) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+
+	err := r.reader.Close()
+	for _, closer := range r.closers {
+		err = errors.Join(err, closer.Close())
+	}
+	return err
 }
 
 func referencesEqual(a, b *plumbing.Reference) bool {
