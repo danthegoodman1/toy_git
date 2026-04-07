@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
 )
@@ -23,13 +25,15 @@ type repoBackend interface {
 }
 
 type diskBackend struct {
-	root string
+	root          string
+	onlyBranch    plumbing.ReferenceName
+	linearHistory bool
 }
 
 var _ repoBackend = (*diskBackend)(nil)
 var _ transport.Loader = (*diskBackend)(nil)
 
-func newDiskBackend(root string) (*diskBackend, error) {
+func newDiskBackend(root string, onlyBranch string, linearHistory bool) (*diskBackend, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve data dir: %w", err)
@@ -39,7 +43,11 @@ func newDiskBackend(root string) (*diskBackend, error) {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
-	return &diskBackend{root: absRoot}, nil
+	return &diskBackend{
+		root:          absRoot,
+		onlyBranch:    plumbing.ReferenceName(onlyBranch),
+		linearHistory: linearHistory,
+	}, nil
 }
 
 func (b *diskBackend) Load(ep *transport.Endpoint) (storage.Storer, error) {
@@ -63,7 +71,16 @@ func (b *diskBackend) Open(ctx context.Context, repo string) (storage.Storer, er
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return newDiskStorer(ctx, repoDir), nil
+	st := newDiskStorer(ctx, repoDir)
+	if b.onlyBranch == "" && !b.linearHistory {
+		return st, nil
+	}
+
+	return &policyStorer{
+		Storer:        st,
+		onlyBranch:    b.onlyBranch,
+		linearHistory: b.linearHistory,
+	}, nil
 }
 
 func (b *diskBackend) LFSObjectPath(ctx context.Context, repo, oid string) (string, error) {
@@ -162,12 +179,93 @@ func (b *diskBackend) repoDir(repo string) (string, error) {
 }
 
 func InitBareRepo(dataDir, repo string) error {
-	backend, err := newDiskBackend(dataDir)
+	backend, err := newDiskBackend(dataDir, "", false)
 	if err != nil {
 		return err
 	}
 
 	return backend.InitBareRepo(repo)
+}
+
+type policyStorer struct {
+	storage.Storer
+	onlyBranch    plumbing.ReferenceName
+	linearHistory bool
+}
+
+func (s *policyStorer) SetReference(ref *plumbing.Reference) error {
+	if err := s.checkReferenceAllowed(ref.Name()); err != nil {
+		return err
+	}
+	if err := s.checkLinearHistory(ref); err != nil {
+		return err
+	}
+
+	return s.Storer.SetReference(ref)
+}
+
+func (s *policyStorer) CheckAndSetReference(newRef, old *plumbing.Reference) error {
+	if err := s.checkReferenceAllowed(newRef.Name()); err != nil {
+		return err
+	}
+	if err := s.checkLinearHistory(newRef); err != nil {
+		return err
+	}
+
+	return s.Storer.CheckAndSetReference(newRef, old)
+}
+
+func (s *policyStorer) RemoveReference(name plumbing.ReferenceName) error {
+	if err := s.checkReferenceAllowed(name); err != nil {
+		return err
+	}
+
+	return s.Storer.RemoveReference(name)
+}
+
+func (s *policyStorer) checkReferenceAllowed(name plumbing.ReferenceName) error {
+	if s.onlyBranch == "" || name == plumbing.HEAD || name == s.onlyBranch {
+		return nil
+	}
+
+	return fmt.Errorf("pushes are only allowed to %s", s.onlyBranch)
+}
+
+func (s *policyStorer) checkLinearHistory(ref *plumbing.Reference) error {
+	if !s.linearHistory || ref == nil || ref.Name() == plumbing.HEAD || !ref.Name().IsBranch() || ref.Type() != plumbing.HashReference {
+		return nil
+	}
+
+	current, err := s.Storer.Reference(ref.Name())
+	if err != nil {
+		if errors.Is(err, plumbing.ErrReferenceNotFound) {
+			return nil
+		}
+		return err
+	}
+
+	if current.Type() != plumbing.HashReference || current.Hash() == ref.Hash() {
+		return nil
+	}
+
+	currentCommit, err := object.GetCommit(s.Storer, current.Hash())
+	if err != nil {
+		return err
+	}
+	newCommit, err := object.GetCommit(s.Storer, ref.Hash())
+	if err != nil {
+		return err
+	}
+
+	isAncestor, err := currentCommit.IsAncestor(newCommit)
+	if err != nil {
+		return err
+	}
+	if isAncestor {
+		return nil
+	}
+
+	return fmt.Errorf("linear history required for %s", ref.Name())
 }
 
 func normalizeRepoPath(repo string) (string, error) {

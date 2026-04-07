@@ -46,6 +46,8 @@ type Config struct {
 	AllowedPublicKeyPath string
 	HTTPUsername         string
 	HTTPPassword         string
+	OnlyBranch           string
+	LinearHistory        bool
 }
 
 type Server struct {
@@ -72,7 +74,7 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 
-	backend, err := newDiskBackend(cfg.DataDir)
+	backend, err := newDiskBackend(cfg.DataDir, cfg.OnlyBranch, cfg.LinearHistory)
 	if err != nil {
 		return nil, err
 	}
@@ -505,6 +507,9 @@ func applyDefaults(cfg Config) (Config, error) {
 	}
 	if cfg.HTTPPassword == "" {
 		cfg.HTTPPassword = defaultHTTPPassword
+	}
+	if cfg.OnlyBranch != "" && !strings.HasPrefix(cfg.OnlyBranch, "refs/heads/") {
+		return Config{}, fmt.Errorf("only branch must be a refs/heads/* ref")
 	}
 
 	var err error

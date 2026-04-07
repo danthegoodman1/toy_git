@@ -42,6 +42,58 @@ func TestHTTPAuthWithGitCLI(t *testing.T) {
 	assertContainsAny(t, output, "Authentication failed", "authentication failed", "HTTP Basic: Access denied", "401")
 }
 
+func TestHTTPPushRejectsNonMainBranchWhenOnlyMainIsAllowed(t *testing.T) {
+	t.Parallel()
+
+	srv, repoDir := startConfiguredTestServer(t, Config{
+		OnlyBranch: "refs/heads/main",
+	})
+	worktree := createWorktree(t)
+
+	httpRemote := srv.HTTPBaseURL() + "/test.git"
+	pushURL := strings.Replace(httpRemote, "http://", "http://username:password@", 1)
+
+	runGit(t, worktree, nil, "push", pushURL, "HEAD:refs/heads/main")
+	runGit(t, repoDir, nil, "--git-dir", repoDir, "rev-parse", "refs/heads/main")
+
+	output, err := runGitExpectError(t, worktree, nil, "push", pushURL, "HEAD:refs/heads/feature")
+	if err == nil {
+		t.Fatalf("expected push to non-main branch to fail")
+	}
+	assertContainsAny(t, output, "pushes are only allowed to refs/heads/main")
+}
+
+func TestHTTPPushRejectsNonFastForwardWhenLinearHistoryIsRequired(t *testing.T) {
+	t.Parallel()
+
+	srv, repoDir := startConfiguredTestServer(t, Config{
+		LinearHistory: true,
+	})
+	worktree := createWorktree(t)
+
+	httpRemote := srv.HTTPBaseURL() + "/test.git"
+	pushURL := strings.Replace(httpRemote, "http://", "http://username:password@", 1)
+
+	runGit(t, worktree, nil, "push", pushURL, "HEAD:refs/heads/main")
+	runGit(t, repoDir, nil, "--git-dir", repoDir, "rev-parse", "refs/heads/main")
+
+	cloneA := filepath.Join(t.TempDir(), "clone-a")
+	cloneB := filepath.Join(t.TempDir(), "clone-b")
+	runGit(t, t.TempDir(), nil, "clone", "--branch", "main", pushURL, cloneA)
+	runGit(t, t.TempDir(), nil, "clone", "--branch", "main", pushURL, cloneB)
+
+	writeAndCommitFile(t, cloneA, "a.txt", "from clone a\n", "commit from clone a")
+	writeAndCommitFile(t, cloneB, "b.txt", "from clone b\n", "commit from clone b")
+
+	runGit(t, cloneA, nil, "push", "origin", "HEAD:refs/heads/main")
+
+	output, err := runGitExpectError(t, cloneB, nil, "push", "--force", "origin", "HEAD:refs/heads/main")
+	if err == nil {
+		t.Fatalf("expected non-fast-forward push to fail")
+	}
+	assertContainsAny(t, output, "linear history required for refs/heads/main")
+}
+
 func TestSSHAuthWithGitCLI(t *testing.T) {
 	t.Parallel()
 
@@ -345,14 +397,20 @@ func TestLFSTransferOverSSH(t *testing.T) {
 func startTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 
+	return startConfiguredTestServer(t, Config{})
+}
+
+func startConfiguredTestServer(t *testing.T, cfg Config) (*Server, string) {
+	t.Helper()
+
 	dataDir := t.TempDir()
 	if err := InitBareRepo(dataDir, "test.git"); err != nil {
 		t.Fatalf("init bare repo: %v", err)
 	}
 
-	srv, err := NewServer(Config{
-		DataDir: dataDir,
-	})
+	cfg.DataDir = dataDir
+
+	srv, err := NewServer(cfg)
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
@@ -400,6 +458,16 @@ func createLFSWorktree(t *testing.T) (string, string) {
 	runGit(t, dir, nil, "add", ".gitattributes", "large.bin")
 	runGit(t, dir, nil, "-c", "user.name=Codex", "-c", "user.email=codex@example.com", "commit", "-m", "add lfs blob")
 	return dir, content
+}
+
+func writeAndCommitFile(t *testing.T, dir, name, content, message string) {
+	t.Helper()
+
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		t.Fatalf("write file %s: %v", name, err)
+	}
+	runGit(t, dir, nil, "add", name)
+	runGit(t, dir, nil, "-c", "user.name=Codex", "-c", "user.email=codex@example.com", "commit", "-m", message)
 }
 
 func seedRepo(t *testing.T, repoDir string) {

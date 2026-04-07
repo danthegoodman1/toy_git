@@ -14,13 +14,15 @@ import (
 
 func main() {
 	var (
-		dataDir      = flag.String("data-dir", "./data", "directory used to store repositories")
-		httpAddr     = flag.String("http-addr", "127.0.0.1:8080", "HTTP listen address")
-		sshAddr      = flag.String("ssh-addr", "127.0.0.1:2222", "SSH listen address")
-		repos        = flag.String("repos", "test.git", "comma-separated repo names to initialize")
-		allowedKey   = flag.String("authorized-key", "~/.ssh/id_rsa.pub", "path to the single allowed SSH public key")
-		httpUsername = flag.String("http-username", "username", "HTTP basic auth username")
-		httpPassword = flag.String("http-password", "password", "HTTP basic auth password")
+		dataDir       = flag.String("data-dir", "./data", "directory used to store repositories")
+		httpAddr      = flag.String("http-addr", "127.0.0.1:8080", "HTTP listen address")
+		sshAddr       = flag.String("ssh-addr", "127.0.0.1:2222", "SSH listen address")
+		repos         = flag.String("repos", "test.git", "comma-separated repo names to initialize")
+		allowedKey    = flag.String("authorized-key", "~/.ssh/id_rsa.pub", "path to the single allowed SSH public key")
+		httpUsername  = flag.String("http-username", "username", "HTTP basic auth username")
+		httpPassword  = flag.String("http-password", "password", "HTTP basic auth password")
+		onlyBranch    = flag.String("only-branch", "", "if set, only allow pushes to this full refs/heads/* branch")
+		linearHistory = flag.Bool("linear-history", false, "if set, only allow fast-forward updates to branch refs")
 	)
 	flag.Parse()
 
@@ -42,6 +44,8 @@ func main() {
 		AllowedPublicKeyPath: *allowedKey,
 		HTTPUsername:         *httpUsername,
 		HTTPPassword:         *httpPassword,
+		OnlyBranch:           *onlyBranch,
+		LinearHistory:        *linearHistory,
 	})
 	if err != nil {
 		fatalf("create server: %v", err)
