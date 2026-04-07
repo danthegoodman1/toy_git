@@ -89,6 +89,26 @@ func ListCommitTreePath(s storer.EncodedObjectStorer, commitHash plumbing.Hash, 
 	return entries, nil
 }
 
+// ReadCommitFile opens a reader for a file path within a commit.
+func ReadCommitFile(s storer.EncodedObjectStorer, commitHash plumbing.Hash, filePath string) (io.ReadCloser, error) {
+	root, err := getCommitRootTree(s, commitHash)
+	if err != nil {
+		return nil, err
+	}
+
+	cleanPath, err := cleanCommitPath(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := root.File(cleanPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return file.Reader()
+}
+
 func writeTree(w *bufio.Writer, tree *object.Tree, depth int) error {
 	order := make([]int, len(tree.Entries))
 	for i := range tree.Entries {
@@ -140,22 +160,36 @@ func getCommitRootTree(s storer.EncodedObjectStorer, commitHash plumbing.Hash) (
 }
 
 func getTreeAtPath(root *object.Tree, dir string) (*object.Tree, string, error) {
-	cleanPath := strings.TrimPrefix(strings.TrimSpace(dir), "/")
-	if cleanPath == "" || cleanPath == "." {
+	cleanPath, err := cleanCommitPath(dir)
+	if err != nil {
+		return nil, "", err
+	}
+	if cleanPath == "" {
 		return root, "", nil
 	}
-
-	cleanPath = path.Clean(cleanPath)
-	if cleanPath == "." {
-		return root, "", nil
-	}
-
 	tree, err := root.Tree(cleanPath)
 	if err != nil {
 		return nil, "", err
 	}
 
 	return tree, cleanPath, nil
+}
+
+func cleanCommitPath(raw string) (string, error) {
+	cleanPath := strings.TrimPrefix(strings.TrimSpace(raw), "/")
+	if cleanPath == "" || cleanPath == "." {
+		return "", nil
+	}
+
+	cleanPath = path.Clean(cleanPath)
+	if cleanPath == "." {
+		return "", nil
+	}
+	if cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
+		return "", fmt.Errorf("invalid path %q", raw)
+	}
+
+	return cleanPath, nil
 }
 
 func sortTreeEntries(entries []object.TreeEntry, order []int) {

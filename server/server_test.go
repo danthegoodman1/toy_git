@@ -403,6 +403,30 @@ func TestListCommitTreePath(t *testing.T) {
 	}
 }
 
+func TestReadCommitFile(t *testing.T) {
+	t.Parallel()
+
+	st, commitHash := createTreeLayoutRepo(t)
+
+	reader, err := ReadCommitFile(st, plumbing.NewHash(commitHash), "docs/guides/setup.md")
+	if err != nil {
+		t.Fatalf("read commit file: %v", err)
+	}
+	defer reader.Close()
+
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read commit file contents: %v", err)
+	}
+
+	t.Logf("contents for docs/guides/setup.md:\n%s", got)
+
+	want := "# setup\n"
+	if string(got) != want {
+		t.Fatalf("unexpected file contents:\nwant:\n%s\ngot:\n%s", want, got)
+	}
+}
+
 func TestLFSTransferOverHTTP(t *testing.T) {
 	t.Parallel()
 
