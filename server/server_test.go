@@ -20,6 +20,7 @@ import (
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
+	"github.com/go-git/go-git/v6/plumbing/storer"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -338,6 +339,70 @@ func TestDiskStorerEncodedObjectStreamsFromDisk(t *testing.T) {
 	}
 }
 
+func TestFormatCommitTree(t *testing.T) {
+	t.Parallel()
+
+	st, commitHash := createTreeLayoutRepo(t)
+
+	got, err := FormatCommitTree(st, plumbing.NewHash(commitHash))
+	if err != nil {
+		t.Fatalf("format commit tree: %v", err)
+	}
+
+	t.Logf("commit tree for %s:\n%s", commitHash, got)
+
+	want := "" +
+		"cmd/\n" +
+		"  demo/\n" +
+		"    main.go\n" +
+		"docs/\n" +
+		"  guides/\n" +
+		"    setup.md\n" +
+		"internal/\n" +
+		"  git/\n" +
+		"    tree.go\n" +
+		"README.md\n" +
+		"go.mod\n"
+	if got != want {
+		t.Fatalf("unexpected tree output:\nwant:\n%s\ngot:\n%s", want, got)
+	}
+}
+
+func TestListCommitTreePath(t *testing.T) {
+	t.Parallel()
+
+	st, commitHash := createTreeLayoutRepo(t)
+
+	rootEntries, err := ListCommitTreePath(st, plumbing.NewHash(commitHash), "")
+	if err != nil {
+		t.Fatalf("list root tree: %v", err)
+	}
+	gotRoot := formatListedEntries(rootEntries)
+	t.Logf("root entries:\n%s", gotRoot)
+
+	wantRoot := "" +
+		"cmd/ (cmd)\n" +
+		"docs/ (docs)\n" +
+		"internal/ (internal)\n" +
+		"README.md (README.md)\n" +
+		"go.mod (go.mod)\n"
+	if gotRoot != wantRoot {
+		t.Fatalf("unexpected root listing:\nwant:\n%s\ngot:\n%s", wantRoot, gotRoot)
+	}
+
+	nestedEntries, err := ListCommitTreePath(st, plumbing.NewHash(commitHash), "docs/guides")
+	if err != nil {
+		t.Fatalf("list nested tree: %v", err)
+	}
+	gotNested := formatListedEntries(nestedEntries)
+	t.Logf("nested entries for docs/guides:\n%s", gotNested)
+
+	wantNested := "setup.md (docs/guides/setup.md)\n"
+	if gotNested != wantNested {
+		t.Fatalf("unexpected nested listing:\nwant:\n%s\ngot:\n%s", wantNested, gotNested)
+	}
+}
+
 func TestLFSTransferOverHTTP(t *testing.T) {
 	t.Parallel()
 
@@ -463,11 +528,70 @@ func createLFSWorktree(t *testing.T) (string, string) {
 func writeAndCommitFile(t *testing.T, dir, name, content, message string) {
 	t.Helper()
 
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
-		t.Fatalf("write file %s: %v", name, err)
-	}
+	writeWorktreeFile(t, dir, name, content)
 	runGit(t, dir, nil, "add", name)
 	runGit(t, dir, nil, "-c", "user.name=Codex", "-c", "user.email=codex@example.com", "commit", "-m", message)
+}
+
+func writeWorktreeFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+
+	fullPath := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+		t.Fatalf("mkdir for %s: %v", name, err)
+	}
+	if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write file %s: %v", name, err)
+	}
+}
+
+func createTreeLayoutRepo(t *testing.T) (storer.EncodedObjectStorer, string) {
+	t.Helper()
+
+	dataDir := t.TempDir()
+	if err := InitBareRepo(dataDir, "test.git"); err != nil {
+		t.Fatalf("init bare repo: %v", err)
+	}
+	repoDir := filepath.Join(dataDir, "test.git")
+
+	worktree := t.TempDir()
+	runGit(t, worktree, nil, "init")
+	writeWorktreeFile(t, worktree, "README.md", "hello\n")
+	writeWorktreeFile(t, worktree, "go.mod", "module example.com/tree\n")
+	writeWorktreeFile(t, worktree, "cmd/demo/main.go", "package main\n")
+	writeWorktreeFile(t, worktree, "internal/git/tree.go", "package git\n")
+	writeWorktreeFile(t, worktree, "docs/guides/setup.md", "# setup\n")
+	runGit(t, worktree, nil, "add", ".")
+	runGit(t, worktree, nil, "-c", "user.name=Codex", "-c", "user.email=codex@example.com", "commit", "-m", "add tree layout")
+	runGit(t, worktree, nil, "push", repoDir, "HEAD:refs/heads/main")
+
+	commitHash := strings.TrimSpace(runGit(t, repoDir, nil, "--git-dir", repoDir, "rev-parse", "refs/heads/main"))
+
+	backend, err := newDiskBackend(dataDir, "", false)
+	if err != nil {
+		t.Fatalf("new disk backend: %v", err)
+	}
+	st, err := backend.Open(context.Background(), "test.git")
+	if err != nil {
+		t.Fatalf("open repo: %v", err)
+	}
+
+	return st, commitHash
+}
+
+func formatListedEntries(entries []CommitTreeEntry) string {
+	var buf strings.Builder
+	for _, entry := range entries {
+		buf.WriteString(entry.Name)
+		if entry.IsDir {
+			buf.WriteString("/")
+		}
+		buf.WriteString(" (")
+		buf.WriteString(entry.Path)
+		buf.WriteString(")\n")
+	}
+
+	return buf.String()
 }
 
 func seedRepo(t *testing.T, repoDir string) {
